@@ -11,12 +11,12 @@ from groq import Groq
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 
-# --- 1. CONFIG & DB INITIALIZATION ---
-# Load from .env.local and override system cache to ensure new keys work
+# --- 1. BOOT SEQUENCE & FORCED CONFIG ---
+# override=True ensures that Railway environment variables take priority over local files
 env_path = Path('.') / '.env.local'
 load_dotenv(dotenv_path=env_path, override=True)
 
-# Database path (survives restarts on local, Railway needs volume for persistence)
+# Railway Volume Logic (Defaults to leads.db in root)
 DB_PATH = os.getenv("DATABASE_URL", "leads.db")
 
 print(f"\n--- AUDITFLOW AI: MASTER BOOT SEQUENCE ---")
@@ -24,14 +24,14 @@ print(f"DEBUG: Database Path: {DB_PATH}")
 
 current_groq = os.getenv("GROQ_API_KEY")
 if current_groq:
-    print(f"DEBUG: Groq API Key Detected: {current_groq[:10]}...")
+    print(f"DEBUG: Groq Key Detected: {current_groq[:10]}...")
 else:
-    print("DEBUG: !!! ERROR - GROQ_API_KEY NOT FOUND !!!")
+    print("DEBUG: ERROR - GROQ_API_KEY NOT FOUND!")
 
 def init_db():
+    """Initializes the SQLite lead-tracking database."""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    # Table stores every single audit metric we gather
     c.execute('''CREATE TABLE IF NOT EXISTS audits 
                  (id INTEGER PRIMARY KEY AUTOINCREMENT, 
                   brand TEXT, url TEXT, score INTEGER, 
@@ -44,15 +44,15 @@ init_db()
 app = FastAPI()
 templates = Jinja2Templates(directory="templates")
 
-# API Keys from Environment
+# API Config
 PSI_API_KEY = os.getenv("PAGESPEED_API_KEY")
 TELE_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELE_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-# --- 2. THE AUDIT ENGINE ---
+# --- 2. ENGINE LOGIC ---
 
 def get_brand_name(url):
-    """Extracts a clean brand name from the URL for the AI to use."""
+    """Cleanly extracts the brand name from the URL."""
     try:
         domain = url.split("//")[-1].split("www.")[-1].split(".")[0]
         if "-" in domain:
@@ -62,9 +62,9 @@ def get_brand_name(url):
         return "the team"
 
 def get_tech_audit(url):
-    """Scrapes site to detect CMS and count every single script tag."""
+    """Scrapes for CMS and counts all <script> tags."""
     try:
-        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
         res = requests.get(url, headers=headers, timeout=10)
         soup = BeautifulSoup(res.text, 'html.parser')
         html = res.text.lower()
@@ -75,14 +75,13 @@ def get_tech_audit(url):
         elif 'wix' in html: cms = "Wix"
         elif 'webflow' in html: cms = "Webflow"
         
-        # Count all <script> tags for the "script bloat" pain point
         script_count = len(soup.find_all('script'))
         return {"cms": cms, "scripts": script_count}
     except:
         return {"cms": "Unknown", "scripts": 0}
 
 def get_performance_audit(url):
-    """Fetches Mobile Performance Score, TTI, and FCP from Google PSI."""
+    """Fetches full Lighthouse metrics from Google."""
     try:
         api_url = f"https://www.googleapis.com/pagespeedonline/v5/runPagespeed?url={url}&key={PSI_API_KEY}&strategy=mobile"
         r = requests.get(api_url).json()
@@ -93,12 +92,11 @@ def get_performance_audit(url):
         fcp = audits['first-contentful-paint']['displayValue']
         
         return {"score": int(score), "tti": tti, "fcp": fcp}
-    except Exception as e:
-        print(f"PSI API Error: {e}")
+    except:
         return {"score": 0, "tti": "N/A", "fcp": "N/A"}
 
 def push_to_telegram(message):
-    """Sends the data and the drafted DM to your phone via Telegram Bot."""
+    """Pushes the result to your phone via Telegram."""
     try:
         url = f"https://api.telegram.org/bot{TELE_TOKEN}/sendMessage"
         payload = {"chat_id": TELE_CHAT_ID, "text": message, "parse_mode": "Markdown"}
@@ -106,25 +104,23 @@ def push_to_telegram(message):
     except:
         pass
 
-# --- 3. DASHBOARD ROUTES (PYTHON 3.13 COMPLIANT) ---
+# --- 3. ROUTES (FIXED FOR PYTHON 3.13) ---
 
 @app.get("/", response_class=HTMLResponse)
 async def dashboard(request: Request):
-    # Fetch History
+    # Fetch Audit History and Total Count
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("SELECT id, brand, url, score, cms, timestamp FROM audits ORDER BY id DESC LIMIT 15")
     history = c.fetchall()
-    
-    # Fetch Total Count
     c.execute("SELECT COUNT(*) FROM audits")
     total_leads = c.fetchone()[0]
     conn.close()
     
-    # FIXED: Python 3.13 requires explicit keyword arguments for TemplateResponse
+    # CRITICAL FIX: Use named keywords (request=request, name=..., context=...)
     return templates.TemplateResponse(
-        request=request, 
-        name="index.html", 
+        request=request,
+        name="index.html",
         context={"history": history, "total": total_leads}
     )
 
@@ -147,23 +143,17 @@ async def run_audit(request: Request, url: str = Form(...)):
     conn.commit()
     conn.close()
 
-    # 3. AI Outreach Logic (The High-Conversion Human Prompt)
-    # Using Llama 3.3 70B for maximum intelligence
+    # 3. AI Personalization (Human Peer-to-Peer Prompt)
     prompt = f"""
-    You are a high-level developer. Write a casual, peer-to-peer 2-sentence Instagram DM to the owner of {brand}.
+    You are a developer. Write a casual, 2-sentence Instagram DM to the owner of {brand}.
+    Data: Site uses {tech['cms']}, Mobile Score is {perf['score']}/100, Load Time is {perf['tti']}.
     
-    DATA TO USE:
-    - Tech Platform: {tech['cms']}
-    - Mobile Load Time: {perf['tti']}
-    - Performance Score: {perf['score']}/100
-
-    RULES:
-    1. DO NOT include any links or URLs.
-    2. Start with "Hey {brand} team" or "Hi {brand}".
-    3. Mention the {tech['cms']} setup feels slow on mobile (taking {perf['tti']} to load).
-    4. Reference that a 1s delay drops conversions by 7%.
-    5. Offer a free 60-second video on one specific fix to speed it up.
-    6. Sound like a real human peer, NOT a marketing bot. No "hope this finds you well".
+    Rules:
+    - NO links/URLs.
+    - Start with "Hi {brand} team" or "Hey {brand}".
+    - Mention the site feels slow on mobile (taking {perf['tti']}).
+    - Offer a free 60-second video on one specific fix.
+    - Tone: Expert peer, helpful, zero marketing bot-speak.
     """
 
     try:
@@ -176,11 +166,11 @@ async def run_audit(request: Request, url: str = Form(...)):
     except Exception as e:
         dm_output = f"AI Error: {str(e)}"
 
-    # 4. Push Notification to Telegram
-    tele_msg = f"🚀 *Audit #{brand} Complete!*\n⚡ Score: {perf['score']}\n🛠 CMS: {tech['cms']}\n\n*Draft DM:*\n{dm_output}"
+    # 4. Telegram Notification
+    tele_msg = f"🚀 *Audit #{brand} Done!*\n⚡ Score: {perf['score']}\n🛠 CMS: {tech['cms']}\n\n*Draft DM:*\n{dm_output}"
     push_to_telegram(tele_msg)
 
-    # 5. Fetch History and Total for UI Refresh
+    # 5. Refresh History
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("SELECT id, brand, url, score, cms, timestamp FROM audits ORDER BY id DESC LIMIT 15")
@@ -189,10 +179,10 @@ async def run_audit(request: Request, url: str = Form(...)):
     total_leads = c.fetchone()[0]
     conn.close()
 
-    # FIXED: Python 3.13 requires explicit keyword arguments
+    # CRITICAL FIX: Use named keywords
     return templates.TemplateResponse(
-        request=request, 
-        name="index.html", 
+        request=request,
+        name="index.html",
         context={
             "result": {"brand": brand, "url": target_url, "perf": perf, "tech": tech, "dm": dm_output},
             "history": history,
