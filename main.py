@@ -11,22 +11,25 @@ from groq import Groq
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 
-# --- 1. CONFIG & DATABASE INITIALIZATION ---
+# --- 1. BOOT SEQUENCE & CONFIG ---
 env_path = Path('.') / '.env.local'
 load_dotenv(dotenv_path=env_path, override=True)
 
-# DEBUG: Verify key loading
-current_key = os.getenv("GROQ_API_KEY")
-print(f"\n--- AUDITFLOW AI BOOT SEQUENCE ---")
-if current_key:
-    print(f"STATUS: SUCCESS - Groq Key Loaded: {current_key[:10]}...")
+# Railway Volume Pathing (Ensures your data survives restarts)
+DB_PATH = os.getenv("DATABASE_URL", "leads.db")
+
+print(f"\n--- AUDITFLOW AI: BOOTING SYSTEM ---")
+print(f"DEBUG: Loading Database from: {DB_PATH}")
+
+current_groq = os.getenv("GROQ_API_KEY")
+if current_groq:
+    print(f"DEBUG: Groq Key Loaded: {current_groq[:10]}...")
 else:
-    print("STATUS: ERROR - No GROQ_API_KEY found in .env.local!")
+    print("DEBUG: ERROR - No Groq Key found!")
 
 def init_db():
-    conn = sqlite3.connect('leads.db')
+    conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    # Stores: Brand Name, URL, Performance Score, CMS, Script Count, Timestamp
     c.execute('''CREATE TABLE IF NOT EXISTS audits 
                  (id INTEGER PRIMARY KEY AUTOINCREMENT, 
                   brand TEXT, url TEXT, score INTEGER, 
@@ -39,25 +42,21 @@ init_db()
 app = FastAPI()
 templates = Jinja2Templates(directory="templates")
 
-# Initialize API Config
+# API Keys
 PSI_API_KEY = os.getenv("PAGESPEED_API_KEY")
 TELE_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELE_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-# --- 2. HELPER FUNCTIONS ---
+# --- 2. THE AUDIT ENGINE ---
 
 def get_brand_name(url):
-    """Extracts a clean brand name from the URL."""
     try:
         domain = url.split("//")[-1].split("www.")[-1].split(".")[0]
-        if "-" in domain:
-            return " ".join([word.capitalize() for word in domain.split("-")])
-        return domain.capitalize()
-    except:
-        return "the team"
+        return domain.capitalize() if "-" not in domain else " ".join([w.capitalize() for w in domain.split("-")])
+    except: return "the team"
 
 def get_tech_audit(url):
-    """Detects CMS and counts external scripts."""
+    """Scrapes for CMS and script bloat."""
     try:
         headers = {'User-Agent': 'Mozilla/5.0'}
         res = requests.get(url, headers=headers, timeout=10)
@@ -70,23 +69,21 @@ def get_tech_audit(url):
         elif 'wix' in html: cms = "Wix"
         elif 'webflow' in html: cms = "Webflow"
         
-        script_count = len(soup.find_all('script'))
-        return {"cms": cms, "scripts": script_count}
+        return {"cms": cms, "scripts": len(soup.find_all('script'))}
     except:
         return {"cms": "Unknown", "scripts": 0}
 
 def get_performance_audit(url):
-    """Fetches full Lighthouse metrics."""
+    """Google PageSpeed Insights API Logic."""
     try:
         api_url = f"https://www.googleapis.com/pagespeedonline/v5/runPagespeed?url={url}&key={PSI_API_KEY}&strategy=mobile"
         r = requests.get(api_url).json()
-        
         score = r['lighthouseResult']['categories']['performance']['score'] * 100
         tti = r['lighthouseResult']['audits']['interactive']['displayValue']
         fcp = r['lighthouseResult']['audits']['first-contentful-paint']['displayValue']
-        
         return {"score": int(score), "tti": tti, "fcp": fcp}
-    except:
+    except Exception as e:
+        print(f"API Error: {e}")
         return {"score": 0, "tti": "N/A", "fcp": "N/A"}
 
 def push_to_telegram(message):
@@ -94,60 +91,56 @@ def push_to_telegram(message):
         url = f"https://api.telegram.org/bot{TELE_TOKEN}/sendMessage"
         payload = {"chat_id": TELE_CHAT_ID, "text": message, "parse_mode": "Markdown"}
         requests.post(url, json=payload)
-    except:
-        pass
+    except: pass
 
-# --- 3. ROUTES ---
+# --- 3. DASHBOARD ROUTES ---
 
 @app.get("/", response_class=HTMLResponse)
 async def dashboard(request: Request):
-    # Fetch History from Database
-    conn = sqlite3.connect('leads.db')
+    conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("SELECT id, brand, url, score, cms, timestamp FROM audits ORDER BY id DESC LIMIT 15")
     history = c.fetchall()
-    
-    # Get Total Lead Count
     c.execute("SELECT COUNT(*) FROM audits")
     total_leads = c.fetchone()[0]
     conn.close()
     
-    return templates.TemplateResponse("index.html", {
-        "request": request, 
-        "history": history, 
-        "total": total_leads
-    })
+    # FIXED: Modern Starlette syntax
+    return templates.TemplateResponse(
+        request=request, 
+        name="index.html", 
+        context={"history": history, "total": total_leads}
+    )
 
 @app.post("/analyze")
 async def run_audit(request: Request, url: str = Form(...)):
     target_url = url.strip()
-    if not target_url.startswith("http"):
-        target_url = "https://" + target_url
+    if not target_url.startswith("http"): target_url = "https://" + target_url
     
-    # 1. Gather All Data
+    # 1. Run Data Ingestion
     brand = get_brand_name(target_url)
     tech = get_tech_audit(target_url)
     perf = get_performance_audit(target_url)
 
-    # 2. Save Audit to SQLite Database
-    conn = sqlite3.connect('leads.db')
+    # 2. Save Audit to Database
+    conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("INSERT INTO audits (brand, url, score, cms, scripts, timestamp) VALUES (?, ?, ?, ?, ?, ?)",
               (brand, target_url, perf['score'], tech['cms'], tech['scripts'], datetime.now().strftime("%Y-%m-%d %H:%M")))
     conn.commit()
     conn.close()
 
-    # 3. Generate AI Outreach (The Human-Peer Prompt)
+    # 3. AI Outreach Personalization (High-Conversion Prompt)
     prompt = f"""
-    Context: You are a high-level developer. Write a casual, 1-2 sentence Instagram DM.
-    Data: Brand is {brand}, Platform is {tech['cms']}, Load Time is {perf['tti']}.
+    Context: You are a developer. Write a casual, peer-to-peer 2-sentence Instagram DM to {brand}.
+    Data: Site is on {tech['cms']}, mobile load is {perf['tti']}, score is {perf['score']}/100.
     
     Rules:
-    - NEVER include any URLs or links.
+    - NO links/URLs.
     - Start with "Hi {brand} team" or "Hey {brand}".
-    - Mention that the {tech['cms']} site is lagging (taking {perf['tti']}).
-    - Offer a 60-second video on one specific technical fix.
-    - Sound like a real human peer, not an agency bot. No "checking out your site" or "hope this finds you well".
+    - Mention the {tech['cms']} setup feels slow on mobile (taking {perf['tti']}).
+    - Offer a free 60-second video on how to fix it.
+    - Tone: Helpful expert, zero fluff.
     """
 
     try:
@@ -161,11 +154,11 @@ async def run_audit(request: Request, url: str = Form(...)):
         dm_output = f"AI Error: {str(e)}"
 
     # 4. Telegram Notification
-    tele_msg = f"🚀 *Audit #{brand} Complete!*\n⚡ Score: {perf['score']}\n🛠 CMS: {tech['cms']}\n\n*Draft DM:*\n{dm_output}"
+    tele_msg = f"🚀 *Audit #{brand} Done!*\n⚡ Score: {perf['score']}\n🛠 CMS: {tech['cms']}\n\n*Draft DM:*\n{dm_output}"
     push_to_telegram(tele_msg)
 
-    # Re-fetch history for the template refresh
-    conn = sqlite3.connect('leads.db')
+    # 5. Refresh History
+    conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("SELECT id, brand, url, score, cms, timestamp FROM audits ORDER BY id DESC LIMIT 15")
     history = c.fetchall()
@@ -173,12 +166,15 @@ async def run_audit(request: Request, url: str = Form(...)):
     total_leads = c.fetchone()[0]
     conn.close()
 
-    return templates.TemplateResponse("index.html", {
-        "request": request, 
-        "result": {"brand": brand, "url": target_url, "perf": perf, "tech": tech, "dm": dm_output},
-        "history": history,
-        "total": total_leads
-    })
+    return templates.TemplateResponse(
+        request=request, 
+        name="index.html", 
+        context={
+            "result": {"brand": brand, "url": target_url, "perf": perf, "tech": tech, "dm": dm_output},
+            "history": history,
+            "total": total_leads
+        }
+    )
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
