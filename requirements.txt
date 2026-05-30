@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+requests
+groq
+python-dotenv
+jinja2
+python-multipart
+beautifulsoup4
