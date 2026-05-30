@@ -11,13 +11,12 @@ from groq import Groq
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 
-# --- 1. BOOT SEQUENCE & FORCED CONFIG ---
-# Force load from .env.local and override any system-cached keys
+# --- 1. CONFIG & DB INITIALIZATION ---
+# Load from .env.local and override system cache to ensure new keys work
 env_path = Path('.') / '.env.local'
 load_dotenv(dotenv_path=env_path, override=True)
 
-# Railway Persistent Storage Logic
-# Use /tmp/leads.db as a fallback if the local directory is read-only
+# Database path (survives restarts on local, Railway needs volume for persistence)
 DB_PATH = os.getenv("DATABASE_URL", "leads.db")
 
 print(f"\n--- AUDITFLOW AI: MASTER BOOT SEQUENCE ---")
@@ -32,6 +31,7 @@ else:
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
+    # Table stores every single audit metric we gather
     c.execute('''CREATE TABLE IF NOT EXISTS audits 
                  (id INTEGER PRIMARY KEY AUTOINCREMENT, 
                   brand TEXT, url TEXT, score INTEGER, 
@@ -44,7 +44,7 @@ init_db()
 app = FastAPI()
 templates = Jinja2Templates(directory="templates")
 
-# Initialize API Config from Environment
+# API Keys from Environment
 PSI_API_KEY = os.getenv("PAGESPEED_API_KEY")
 TELE_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELE_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
@@ -52,7 +52,7 @@ TELE_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 # --- 2. THE AUDIT ENGINE ---
 
 def get_brand_name(url):
-    """Extracts a clean brand name from the URL for personalization."""
+    """Extracts a clean brand name from the URL for the AI to use."""
     try:
         domain = url.split("//")[-1].split("www.")[-1].split(".")[0]
         if "-" in domain:
@@ -62,7 +62,7 @@ def get_brand_name(url):
         return "the team"
 
 def get_tech_audit(url):
-    """Scrapes site for CMS platform and total external scripts."""
+    """Scrapes site to detect CMS and count every single script tag."""
     try:
         headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
         res = requests.get(url, headers=headers, timeout=10)
@@ -75,13 +75,14 @@ def get_tech_audit(url):
         elif 'wix' in html: cms = "Wix"
         elif 'webflow' in html: cms = "Webflow"
         
+        # Count all <script> tags for the "script bloat" pain point
         script_count = len(soup.find_all('script'))
         return {"cms": cms, "scripts": script_count}
     except:
         return {"cms": "Unknown", "scripts": 0}
 
 def get_performance_audit(url):
-    """Fetches Mobile Lighthouse score, TTI, and FCP."""
+    """Fetches Mobile Performance Score, TTI, and FCP from Google PSI."""
     try:
         api_url = f"https://www.googleapis.com/pagespeedonline/v5/runPagespeed?url={url}&key={PSI_API_KEY}&strategy=mobile"
         r = requests.get(api_url).json()
@@ -97,7 +98,7 @@ def get_performance_audit(url):
         return {"score": 0, "tti": "N/A", "fcp": "N/A"}
 
 def push_to_telegram(message):
-    """Sends the drafted DM and audit stats to your phone."""
+    """Sends the data and the drafted DM to your phone via Telegram Bot."""
     try:
         url = f"https://api.telegram.org/bot{TELE_TOKEN}/sendMessage"
         payload = {"chat_id": TELE_CHAT_ID, "text": message, "parse_mode": "Markdown"}
@@ -105,22 +106,22 @@ def push_to_telegram(message):
     except:
         pass
 
-# --- 3. THE DASHBOARD ROUTES (PYTHON 3.13 COMPLIANT) ---
+# --- 3. DASHBOARD ROUTES (PYTHON 3.13 COMPLIANT) ---
 
 @app.get("/", response_class=HTMLResponse)
 async def dashboard(request: Request):
-    # Fetch audit history
+    # Fetch History
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("SELECT id, brand, url, score, cms, timestamp FROM audits ORDER BY id DESC LIMIT 15")
     history = c.fetchall()
     
-    # Get total counter
+    # Fetch Total Count
     c.execute("SELECT COUNT(*) FROM audits")
     total_leads = c.fetchone()[0]
     conn.close()
     
-    # FIXED: Keyword arguments required for Python 3.13 / Starlette
+    # FIXED: Python 3.13 requires explicit keyword arguments for TemplateResponse
     return templates.TemplateResponse(
         request=request, 
         name="index.html", 
@@ -138,7 +139,7 @@ async def run_audit(request: Request, url: str = Form(...)):
     tech = get_tech_audit(target_url)
     perf = get_performance_audit(target_url)
 
-    # 2. Save Audit to SQLite
+    # 2. Save Audit to Database
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("INSERT INTO audits (brand, url, score, cms, scripts, timestamp) VALUES (?, ?, ?, ?, ?, ?)",
@@ -146,23 +147,23 @@ async def run_audit(request: Request, url: str = Form(...)):
     conn.commit()
     conn.close()
 
-    # 3. AI Hyper-Personalization (The Human-Peer Prompt)
+    # 3. AI Outreach Logic (The High-Conversion Human Prompt)
+    # Using Llama 3.3 70B for maximum intelligence
     prompt = f"""
-    You are a developer who noticed a specific technical flaw on a site. 
-    Write a casual, 2-sentence Instagram DM to the owner of {brand}.
+    You are a high-level developer. Write a casual, peer-to-peer 2-sentence Instagram DM to the owner of {brand}.
     
-    DATA:
-    - Platform: {tech['cms']}
+    DATA TO USE:
+    - Tech Platform: {tech['cms']}
     - Mobile Load Time: {perf['tti']}
-    - Score: {perf['score']}/100
+    - Performance Score: {perf['score']}/100
 
     RULES:
-    1. NO links or URLs.
+    1. DO NOT include any links or URLs.
     2. Start with "Hey {brand} team" or "Hi {brand}".
-    3. Mention the {tech['cms']} setup feels heavy on mobile (taking {perf['tti']}).
+    3. Mention the {tech['cms']} setup feels slow on mobile (taking {perf['tti']} to load).
     4. Reference that a 1s delay drops conversions by 7%.
-    5. Offer a free 60-second video on how to defer the scripts to fix it.
-    6. Sound like a human peer, NO marketing bot jargon.
+    5. Offer a free 60-second video on one specific fix to speed it up.
+    6. Sound like a real human peer, NOT a marketing bot. No "hope this finds you well".
     """
 
     try:
@@ -175,11 +176,11 @@ async def run_audit(request: Request, url: str = Form(...)):
     except Exception as e:
         dm_output = f"AI Error: {str(e)}"
 
-    # 4. Telegram Notification
+    # 4. Push Notification to Telegram
     tele_msg = f"🚀 *Audit #{brand} Complete!*\n⚡ Score: {perf['score']}\n🛠 CMS: {tech['cms']}\n\n*Draft DM:*\n{dm_output}"
     push_to_telegram(tele_msg)
 
-    # 5. Fetch fresh history for the UI refresh
+    # 5. Fetch History and Total for UI Refresh
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("SELECT id, brand, url, score, cms, timestamp FROM audits ORDER BY id DESC LIMIT 15")
@@ -188,7 +189,7 @@ async def run_audit(request: Request, url: str = Form(...)):
     total_leads = c.fetchone()[0]
     conn.close()
 
-    # FIXED: Keyword arguments required for Python 3.13
+    # FIXED: Python 3.13 requires explicit keyword arguments
     return templates.TemplateResponse(
         request=request, 
         name="index.html", 
