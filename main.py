@@ -12,7 +12,6 @@ from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 
 # --- 1. BOOT SEQUENCE & CONFIG ---
-# Force load from .env.local and override any system-cached keys
 env_path = Path('.') / '.env.local'
 load_dotenv(dotenv_path=env_path, override=True)
 
@@ -29,7 +28,6 @@ else:
     print("DEBUG: !!! ERROR - GROQ_API_KEY NOT FOUND !!!")
 
 def init_db():
-    """Initializes the SQLite lead-tracking database."""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS audits 
@@ -62,9 +60,9 @@ def get_brand_name(url):
         return "the team"
 
 def get_tech_audit(url):
-    """Scrapes site for CMS platform and total external scripts."""
+    """Scrapes site for CMS platform and total script count."""
     try:
-        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
         res = requests.get(url, headers=headers, timeout=10)
         soup = BeautifulSoup(res.text, 'html.parser')
         html = res.text.lower()
@@ -81,7 +79,7 @@ def get_tech_audit(url):
         return {"cms": "Unknown", "scripts": 0}
 
 def get_performance_audit(url):
-    """Fetches Mobile Lighthouse score, TTI, FCP, and Third-Party Tools."""
+    """Fetches Lighthouse score and scrapes the 'Unused JavaScript' list."""
     try:
         api_url = f"https://www.googleapis.com/pagespeedonline/v5/runPagespeed?url={url}&key={PSI_API_KEY}&strategy=mobile"
         r = requests.get(api_url).json()
@@ -91,27 +89,61 @@ def get_performance_audit(url):
         tti = audits['interactive']['displayValue']
         fcp = audits['first-contentful-paint']['displayValue']
         
-        # Extract specific Third-Party Tools (Facebook, Hotjar, Klaviyo, etc.)
-        third_parties = []
+        # --- NEW: Scrape "Reduce unused JavaScript" tools ---
+        top_tools_list = []
         try:
-            items = audits.get('third-party-summary', {}).get('details', {}).get('items', [])
-            for item in items:
-                entity = item.get('entity')
-                if entity and entity not in third_parties and "Google" not in entity:
-                    third_parties.append(str(entity))
-        except:
-            pass
+            unused_js = audits.get('unused-javascript', {}).get('details', {}).get('items', [])
+            
+            # Dictionary to translate ugly URLs into Human readable names
+            tool_map = {
+                'googletagmanager.com': 'Google Tag Manager',
+                'connect.facebook.net': 'Facebook Pixel',
+                'hotjar.com': 'Hotjar',
+                'cdn.shopify.com': 'Shopify tracking',
+                'klaviyo.com': 'Klaviyo',
+                'tiktok.com': 'TikTok Pixel',
+                'oncehub.com': 'OnceHub',
+                'leadconnectorhq.com': 'LeadConnector'
+            }
+            
+            for item in unused_js:
+                script_url = item.get('url', '')
+                added = False
+                
+                # Check against our known map
+                for domain, name in tool_map.items():
+                    if domain in script_url and name not in top_tools_list:
+                        top_tools_list.append(name)
+                        added = True
+                        break
+                
+                # If it's a tool we don't know, grab its root domain (e.g. "aov-boost-sales.pages.dev")
+                if not added and script_url.startswith('http'):
+                    try:
+                        clean_domain = script_url.split("//")[-1].split("/")[0].replace('www.', '')
+                        # Ignore the brand's own domain and basic googleapis
+                        if url.split("//")[-1].split("/")[0] not in clean_domain and "googleapis" not in clean_domain:
+                            if clean_domain not in top_tools_list:
+                                top_tools_list.append(clean_domain)
+                    except:
+                        pass
+        except Exception as e:
+            print(f"Error parsing unused JS: {e}")
         
-        # Get top 2 biggest offenders, or fallback to generic term
-        top_tools = " and ".join(third_parties[:2]) if third_parties else "external tracking widgets"
-        
+        # Join the top 2 or 3 tools together (e.g. "Facebook Pixel, Hotjar and Google Tag Manager")
+        if len(top_tools_list) > 1:
+            top_tools = ", ".join(top_tools_list[:2]) + " and " + top_tools_list[2] if len(top_tools_list) > 2 else " and ".join(top_tools_list[:2])
+        elif len(top_tools_list) == 1:
+            top_tools = top_tools_list[0]
+        else:
+            top_tools = "external tracking scripts"
+            
         return {"score": int(score), "tti": tti, "fcp": fcp, "top_tools": top_tools}
     except Exception as e:
         print(f"PSI API Error: {e}")
-        return {"score": 0, "tti": "N/A", "fcp": "N/A", "top_tools": "external tracking widgets"}
+        return {"score": 0, "tti": "N/A", "fcp": "N/A", "top_tools": "external tracking scripts"}
 
 def push_to_telegram(message):
-    """Sends the drafted DM and audit stats to your phone."""
     try:
         url = f"https://api.telegram.org/bot{TELE_TOKEN}/sendMessage"
         payload = {"chat_id": TELE_CHAT_ID, "text": message, "parse_mode": "Markdown"}
@@ -119,22 +151,19 @@ def push_to_telegram(message):
     except:
         pass
 
-# --- 3. THE DASHBOARD ROUTES (PYTHON 3.13 COMPLIANT) ---
+# --- 3. THE DASHBOARD ROUTES (RAILWAY PYTHON 3.13 COMPLIANT) ---
 
 @app.get("/", response_class=HTMLResponse)
 async def dashboard(request: Request):
-    # Fetch audit history
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("SELECT id, brand, url, score, cms, timestamp FROM audits ORDER BY id DESC LIMIT 15")
     history = c.fetchall()
-    
-    # Get total counter
     c.execute("SELECT COUNT(*) FROM audits")
     total_leads = c.fetchone()[0]
     conn.close()
     
-    # CRITICAL FIX FOR RAILWAY PYTHON 3.13: Keyword arguments required
+    # REQUIRED FIX: Explicit Keyword arguments for Python 3.13
     return templates.TemplateResponse(
         request=request, 
         name="index.html", 
@@ -160,7 +189,7 @@ async def run_audit(request: Request, url: str = Form(...)):
     conn.commit()
     conn.close()
 
-    # 3. AI Hyper-Personalization (Name-drops the extracted third-party tools)
+    # 3. AI Hyper-Personalization (Name-drops the Exact Scripts)
     prompt = f"""
     You are a developer. Write a casual, 2-sentence Instagram DM to the owner of {brand}.
     
@@ -172,7 +201,7 @@ async def run_audit(request: Request, url: str = Form(...)):
     RULES:
     1. NO links or URLs.
     2. Start with "Hey {brand} team" or "Hi {brand}".
-    3. Name-drop their specific tools! (e.g. "Noticed your {perf['top_tools']} are making the {tech['cms']} setup heavy, taking {perf['tti']} to load.")
+    3. Name-drop their specific tools! Example: "Noticed your {perf['top_tools']} are making the {tech['cms']} setup heavy, taking {perf['tti']} to fully load."
     4. Reference that a 1s delay drops conversions by 7%.
     5. Offer a free 60-second video on how to defer those exact scripts to fix it.
     6. Sound like a human peer, NO marketing bot jargon.
@@ -189,10 +218,10 @@ async def run_audit(request: Request, url: str = Form(...)):
         dm_output = f"AI Error: {str(e)}"
 
     # 4. Telegram Notification
-    tele_msg = f"🚀 *Audit #{brand} Complete!*\n⚡ Score: {perf['score']}\n🛠 CMS: {tech['cms']}\n\n*Draft DM:*\n{dm_output}"
+    tele_msg = f"🚀 *Audit #{brand} Complete!*\n⚡ Score: {perf['score']}\n🛠 CMS: {tech['cms']}\n🪲 Scripts: {perf['top_tools']}\n\n*Draft DM:*\n{dm_output}"
     push_to_telegram(tele_msg)
 
-    # 5. Fetch fresh history for the UI refresh
+    # 5. Fetch fresh history
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("SELECT id, brand, url, score, cms, timestamp FROM audits ORDER BY id DESC LIMIT 15")
@@ -201,7 +230,7 @@ async def run_audit(request: Request, url: str = Form(...)):
     total_leads = c.fetchone()[0]
     conn.close()
 
-    # CRITICAL FIX FOR RAILWAY PYTHON 3.13: Keyword arguments required
+    # REQUIRED FIX: Explicit Keyword arguments for Python 3.13
     return templates.TemplateResponse(
         request=request, 
         name="index.html", 
