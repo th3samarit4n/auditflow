@@ -29,6 +29,7 @@ else:
     print("DEBUG: !!! ERROR - GROQ_API_KEY NOT FOUND !!!")
 
 def init_db():
+    """Initializes the SQLite lead-tracking database."""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS audits 
@@ -80,7 +81,7 @@ def get_tech_audit(url):
         return {"cms": "Unknown", "scripts": 0}
 
 def get_performance_audit(url):
-    """Fetches Mobile Lighthouse score, TTI, and FCP."""
+    """Fetches Mobile Lighthouse score, TTI, FCP, and Third-Party Tools."""
     try:
         api_url = f"https://www.googleapis.com/pagespeedonline/v5/runPagespeed?url={url}&key={PSI_API_KEY}&strategy=mobile"
         r = requests.get(api_url).json()
@@ -90,10 +91,24 @@ def get_performance_audit(url):
         tti = audits['interactive']['displayValue']
         fcp = audits['first-contentful-paint']['displayValue']
         
-        return {"score": int(score), "tti": tti, "fcp": fcp}
+        # Extract specific Third-Party Tools (Facebook, Hotjar, Klaviyo, etc.)
+        third_parties = []
+        try:
+            items = audits.get('third-party-summary', {}).get('details', {}).get('items', [])
+            for item in items:
+                entity = item.get('entity')
+                if entity and entity not in third_parties and "Google" not in entity:
+                    third_parties.append(str(entity))
+        except:
+            pass
+        
+        # Get top 2 biggest offenders, or fallback to generic term
+        top_tools = " and ".join(third_parties[:2]) if third_parties else "external tracking widgets"
+        
+        return {"score": int(score), "tti": tti, "fcp": fcp, "top_tools": top_tools}
     except Exception as e:
         print(f"PSI API Error: {e}")
-        return {"score": 0, "tti": "N/A", "fcp": "N/A"}
+        return {"score": 0, "tti": "N/A", "fcp": "N/A", "top_tools": "external tracking widgets"}
 
 def push_to_telegram(message):
     """Sends the drafted DM and audit stats to your phone."""
@@ -119,7 +134,7 @@ async def dashboard(request: Request):
     total_leads = c.fetchone()[0]
     conn.close()
     
-    # CRITICAL FIX FOR PYTHON 3.13: Keyword arguments required
+    # CRITICAL FIX FOR RAILWAY PYTHON 3.13: Keyword arguments required
     return templates.TemplateResponse(
         request=request, 
         name="index.html", 
@@ -145,22 +160,21 @@ async def run_audit(request: Request, url: str = Form(...)):
     conn.commit()
     conn.close()
 
-    # 3. AI Hyper-Personalization (The Full Human-Peer Prompt)
+    # 3. AI Hyper-Personalization (Name-drops the extracted third-party tools)
     prompt = f"""
-    You are a developer who noticed a specific technical flaw on a site. 
-    Write a casual, 2-sentence Instagram DM to the owner of {brand}.
+    You are a developer. Write a casual, 2-sentence Instagram DM to the owner of {brand}.
     
     DATA:
     - Platform: {tech['cms']}
-    - Mobile Load Time: {perf['tti']}
-    - Score: {perf['score']}/100
+    - Load Time: {perf['tti']}
+    - Specific Tools Slowing them down: {perf['top_tools']}
 
     RULES:
     1. NO links or URLs.
     2. Start with "Hey {brand} team" or "Hi {brand}".
-    3. Mention the {tech['cms']} setup feels heavy on mobile (taking {perf['tti']}).
+    3. Name-drop their specific tools! (e.g. "Noticed your {perf['top_tools']} are making the {tech['cms']} setup heavy, taking {perf['tti']} to load.")
     4. Reference that a 1s delay drops conversions by 7%.
-    5. Offer a free 60-second video on how to defer the scripts to fix it.
+    5. Offer a free 60-second video on how to defer those exact scripts to fix it.
     6. Sound like a human peer, NO marketing bot jargon.
     """
 
@@ -187,7 +201,7 @@ async def run_audit(request: Request, url: str = Form(...)):
     total_leads = c.fetchone()[0]
     conn.close()
 
-    # CRITICAL FIX FOR PYTHON 3.13: Keyword arguments required
+    # CRITICAL FIX FOR RAILWAY PYTHON 3.13: Keyword arguments required
     return templates.TemplateResponse(
         request=request, 
         name="index.html", 
